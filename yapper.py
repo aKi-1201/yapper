@@ -1,23 +1,27 @@
 import asyncio
 import os
+import random
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
 import discord
 import yt_dlp
+from discord import app_commands
 from discord.ext import commands
 
 # 1. 設定機器人的 Intents
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+app_commands_synced = False
 
 # 2. 設定 yt-dlp 與 FFmpeg 的參數
 ytdl_format_options = {
     "format": "bestaudio/best",
     "outtmpl": "%(extractor)s-%(id)s-%(title)s.%(ext)s",
     "restrictfilenames": True,
+    "cachedir": False,
     "noplaylist": True,
     "nocheckcertificate": True,
     "ignoreerrors": False,
@@ -35,6 +39,7 @@ ffmpeg_options = {
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
 IDLE_DISCONNECT_SECONDS = 300
+MAX_QUEUE_LENGTH = 100
 AUTO_DELETE_USER_COMMANDS = True
 DELETE_COMMAND_DELAY_SECONDS = 1.0
 DELETE_ON_COMMAND_ERROR = True
@@ -69,6 +74,18 @@ def get_state(guild_id: int) -> GuildMusicState:
         state = GuildMusicState()
         music_states[guild_id] = state
     return state
+
+
+def cleanup_guild_state_if_idle(guild_id: int) -> None:
+    state = music_states.get(guild_id)
+    if state is None:
+        return
+
+    has_pending_idle_task = state.idle_disconnect_task and not state.idle_disconnect_task.done()
+    if state.queue or state.now_playing or has_pending_idle_task:
+        return
+
+    music_states.pop(guild_id, None)
 
 
 def format_duration(seconds: Optional[int]) -> str:
@@ -150,6 +167,7 @@ async def idle_disconnect_worker(guild_id: int) -> None:
         current_task = asyncio.current_task()
         if state.idle_disconnect_task is current_task:
             state.idle_disconnect_task = None
+        cleanup_guild_state_if_idle(guild_id)
 
 
 def schedule_idle_disconnect(guild_id: int) -> None:
@@ -284,7 +302,25 @@ async def play_next(ctx: commands.Context) -> None:
 # 3. 建立指令
 @bot.event
 async def on_ready():
+    global app_commands_synced
+
+    if not app_commands_synced:
+        try:
+            synced = await bot.tree.sync()
+        except discord.HTTPException as error:
+            print(f"同步斜線指令失敗：{error}")
+        else:
+            app_commands_synced = True
+            print(f"已同步 {len(synced)} 個斜線指令。")
+
     print(f"成功登入！機器人名稱：{bot.user}")
+
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    state = music_states.pop(guild.id, None)
+    if state is not None:
+        cancel_idle_disconnect(state)
 
 
 @bot.after_invoke
@@ -292,7 +328,8 @@ async def after_invoke_cleanup(ctx):
     await cleanup_user_command_message(ctx)
 
 
-@bot.command(name="join", help="讓機器人加入你的語音頻道")
+@bot.hybrid_command(name="join", help="讓機器人加入你的語音頻道")
+@app_commands.guild_only()
 async def join(ctx):
     if ctx.guild is None:
         await ctx.send("此指令只能在伺服器中使用。")
@@ -316,7 +353,9 @@ async def join(ctx):
     await ctx.send(f"已加入語音頻道：{ctx.voice_client.channel}")
 
 
-@bot.command(name="play", aliases=["p"], help="播放 YouTube 音樂 (輸入: !play <網址或關鍵字>)")
+@bot.hybrid_command(name="play", aliases=["p"], help="播放 YouTube 音樂 (輸入: !play <網址或關鍵字>)")
+@app_commands.guild_only()
+@app_commands.describe(query="YouTube 網址或關鍵字")
 async def play(ctx, *, query: str):
     if ctx.guild is None:
         await ctx.send("此指令只能在伺服器中使用。")
@@ -328,18 +367,36 @@ async def play(ctx, *, query: str):
     state = get_state(ctx.guild.id)
     state.text_channel_id = ctx.channel.id
 
-    async with ctx.typing():
+    if ctx.interaction is not None:
+        if not ctx.interaction.response.is_done():
+            await ctx.defer()
         try:
             song = await extract_song(query)
         except Exception as error:
             print(f"[play] extract_song error: {error}")
             await ctx.send(f"⚠️ 播放失敗：{classify_error(error)}")
             return
+    else:
+        async with ctx.typing():
+            try:
+                song = await extract_song(query)
+            except Exception as error:
+                print(f"[play] extract_song error: {error}")
+                await ctx.send(f"⚠️ 播放失敗：{classify_error(error)}")
+                return
 
+    queue_limit_reached = False
     async with state.lock:
-        cancel_idle_disconnect(state)
-        state.queue.append(song)
-        should_start = not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused())
+        if len(state.queue) >= MAX_QUEUE_LENGTH:
+            queue_limit_reached = True
+        else:
+            cancel_idle_disconnect(state)
+            state.queue.append(song)
+            should_start = not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused())
+
+    if queue_limit_reached:
+        await ctx.send(f"⚠️ 目前佇列已達上限（{MAX_QUEUE_LENGTH} 首），請稍後再加入。")
+        return
 
     if not should_start:
         await ctx.send(f"✅ 已加入佇列: **{song.title}** ({format_duration(song.duration)})")
@@ -348,7 +405,8 @@ async def play(ctx, *, query: str):
     await play_next(ctx)
 
 
-@bot.command(name="skip", help="跳過目前歌曲")
+@bot.hybrid_command(name="skip", help="跳過目前歌曲")
+@app_commands.guild_only()
 async def skip(ctx):
     if not await ensure_same_voice_channel(ctx):
         return
@@ -360,7 +418,8 @@ async def skip(ctx):
     await ctx.send("⏭️ 已跳過目前歌曲。")
 
 
-@bot.command(name="pause", help="暫停播放")
+@bot.hybrid_command(name="pause", help="暫停播放")
+@app_commands.guild_only()
 async def pause(ctx):
     if not await ensure_same_voice_channel(ctx):
         return
@@ -372,7 +431,8 @@ async def pause(ctx):
     await ctx.send("⏸️ 已暫停。")
 
 
-@bot.command(name="resume", help="繼續播放")
+@bot.hybrid_command(name="resume", help="繼續播放")
+@app_commands.guild_only()
 async def resume(ctx):
     if not await ensure_same_voice_channel(ctx):
         return
@@ -384,7 +444,8 @@ async def resume(ctx):
     await ctx.send("▶️ 已繼續播放。")
 
 
-@bot.command(name="stop", help="停止播放並清空佇列")
+@bot.hybrid_command(name="stop", help="停止播放並清空佇列")
+@app_commands.guild_only()
 async def stop(ctx):
     if ctx.guild is None:
         await ctx.send("此指令只能在伺服器中使用。")
@@ -406,7 +467,8 @@ async def stop(ctx):
     await ctx.send("⏹️ 已停止播放並清空佇列。")
 
 
-@bot.command(name="queue", help="查看目前佇列")
+@bot.hybrid_command(name="queue", help="查看目前佇列")
+@app_commands.guild_only()
 async def queue_list(ctx):
     if ctx.guild is None:
         await ctx.send("此指令只能在伺服器中使用。")
@@ -434,7 +496,8 @@ async def queue_list(ctx):
     await ctx.send("\n".join(lines))
 
 
-@bot.command(name="now", help="顯示目前播放")
+@bot.hybrid_command(name="now", help="顯示目前播放")
+@app_commands.guild_only()
 async def now(ctx):
     if ctx.guild is None:
         await ctx.send("此指令只能在伺服器中使用。")
@@ -449,7 +512,29 @@ async def now(ctx):
     await ctx.send(f"🎧 現在播放: **{song.title}**\n連結: {song.webpage_url}")
 
 
-@bot.command(name="leave", help="讓機器人離開語音頻道")
+@bot.hybrid_command(name="roll", help="隨機抽出目前頻道的一位使用者")
+@app_commands.guild_only()
+async def roll(ctx):
+    if ctx.guild is None:
+        await ctx.send("此指令只能在伺服器中使用。")
+        return
+
+    channel_members = getattr(ctx.channel, "members", None)
+    candidates = [member for member in channel_members or [] if not member.bot]
+
+    if not candidates and ctx.author.voice and ctx.author.voice.channel:
+        candidates = [member for member in ctx.author.voice.channel.members if not member.bot]
+
+    if not candidates:
+        await ctx.send("找不到可抽籤的使用者，請確認頻道內有可用成員。")
+        return
+
+    winner = random.choice(candidates)
+    await ctx.send(f"🎲 抽籤結果：{winner.mention}")
+
+
+@bot.hybrid_command(name="leave", help="讓機器人離開語音頻道")
+@app_commands.guild_only()
 async def leave(ctx):
     if ctx.guild is None:
         await ctx.send("此指令只能在伺服器中使用。")
@@ -466,6 +551,7 @@ async def leave(ctx):
             cancel_idle_disconnect(state)
 
         await ctx.voice_client.disconnect()
+        cleanup_guild_state_if_idle(ctx.guild.id)
         await ctx.send("👋 已經離開語音頻道。")
     else:
         await ctx.send("我目前不在任何語音頻道裡面喔！")
@@ -493,6 +579,25 @@ async def on_command_error(ctx, error):
 
     await ctx.send(f"⚠️ 指令失敗：{classify_error(error)}")
     print(f"[command] unhandled error: {error}")
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandInvokeError) and error.original:
+        message = f"⚠️ 指令執行失敗：{classify_error(error.original)}"
+        print(f"[app command] invoke error: {error.original}")
+    elif isinstance(error, app_commands.MissingPermissions):
+        message = "你沒有權限執行此斜線指令。"
+    elif isinstance(error, app_commands.CheckFailure):
+        message = "此斜線指令目前無法在這裡使用。"
+    else:
+        message = f"⚠️ 指令失敗：{classify_error(error)}"
+        print(f"[app command] unhandled error: {error}")
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 # 4. 啟動機器人 (請設定環境變數 DISCORD_BOT_TOKEN)
