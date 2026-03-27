@@ -34,6 +34,7 @@ ffmpeg_options = {
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+IDLE_DISCONNECT_SECONDS = 300
 
 
 @dataclass
@@ -51,6 +52,7 @@ class GuildMusicState:
     text_channel_id: Optional[int] = None
     volume: float = 0.5
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    idle_disconnect_task: Optional[asyncio.Task] = None
 
 
 music_states: dict[int, GuildMusicState] = {}
@@ -96,6 +98,92 @@ async def extract_song(query: str) -> Song:
     return Song(title=title, webpage_url=webpage_url, stream_url=stream_url, duration=duration)
 
 
+def classify_error(error: Exception) -> str:
+    if isinstance(error, yt_dlp.utils.DownloadError):
+        return "無法取得 YouTube 音訊，請確認網址或稍後重試。"
+    if isinstance(error, discord.ClientException):
+        return "語音客戶端發生問題，請重新加入語音頻道後再試。"
+    if isinstance(error, ValueError):
+        return str(error)
+    return f"未預期錯誤：{type(error).__name__}"
+
+
+def cancel_idle_disconnect(state: GuildMusicState) -> None:
+    if state.idle_disconnect_task and not state.idle_disconnect_task.done():
+        state.idle_disconnect_task.cancel()
+    state.idle_disconnect_task = None
+
+
+async def idle_disconnect_worker(guild_id: int) -> None:
+    state = get_state(guild_id)
+    try:
+        await asyncio.sleep(IDLE_DISCONNECT_SECONDS)
+
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            return
+
+        voice_client = guild.voice_client
+        if voice_client is None:
+            return
+
+        should_disconnect = False
+        async with state.lock:
+            if not state.queue and not voice_client.is_playing() and not voice_client.is_paused():
+                state.now_playing = None
+                should_disconnect = True
+
+        if should_disconnect:
+            await voice_client.disconnect()
+            if state.text_channel_id:
+                channel = bot.get_channel(state.text_channel_id)
+                if channel:
+                    await channel.send("🛌 佇列已清空且閒置一段時間，已自動離開語音頻道。")
+    except asyncio.CancelledError:
+        return
+    finally:
+        current_task = asyncio.current_task()
+        if state.idle_disconnect_task is current_task:
+            state.idle_disconnect_task = None
+
+
+def schedule_idle_disconnect(guild_id: int) -> None:
+    state = get_state(guild_id)
+    cancel_idle_disconnect(state)
+    state.idle_disconnect_task = asyncio.create_task(idle_disconnect_worker(guild_id))
+
+
+async def ensure_same_voice_channel(ctx: commands.Context) -> bool:
+    if ctx.voice_client is None or ctx.voice_client.channel is None:
+        await ctx.send("我目前不在語音頻道中。")
+        return False
+
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send("你必須先加入和我同一個語音頻道。")
+        return False
+
+    if ctx.author.voice.channel != ctx.voice_client.channel:
+        await ctx.send(f"請到同一個語音頻道再操作：{ctx.voice_client.channel.mention}")
+        return False
+    return True
+
+
+async def ensure_voice_for_play(ctx: commands.Context) -> bool:
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send("你必須先加入一個語音頻道！")
+        return False
+
+    channel = ctx.author.voice.channel
+    if ctx.voice_client is None:
+        await channel.connect()
+        return True
+
+    if ctx.voice_client.channel != channel:
+        await ctx.send(f"我目前在 {ctx.voice_client.channel.mention}，請到同一頻道再控制播放。")
+        return False
+    return True
+
+
 async def play_next(ctx: commands.Context) -> None:
     voice_client = ctx.voice_client
     if voice_client is None:
@@ -109,8 +197,10 @@ async def play_next(ctx: commands.Context) -> None:
 
         if not state.queue:
             state.now_playing = None
+            schedule_idle_disconnect(ctx.guild.id)
             return
 
+        cancel_idle_disconnect(state)
         next_song = state.queue.popleft()
         state.now_playing = next_song
 
@@ -119,26 +209,24 @@ async def play_next(ctx: commands.Context) -> None:
             volume=state.volume,
         )
 
-    def after_playback(error: Optional[Exception]) -> None:
+    async def handle_after_playback(error: Optional[Exception]) -> None:
         if error:
             print(f"播放發生錯誤: {error}")
-        loop.call_soon_threadsafe(lambda: asyncio.create_task(play_next(ctx)))
+            await ctx.send(f"⚠️ 播放中斷：{classify_error(error)}")
+        await play_next(ctx)
 
-    voice_client.play(source, after=after_playback)
+    def after_playback(error: Optional[Exception]) -> None:
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(handle_after_playback(error)))
+
+    try:
+        voice_client.play(source, after=after_playback)
+    except Exception as error:
+        state.now_playing = None
+        await ctx.send(f"⚠️ 無法開始播放：{classify_error(error)}")
+        await play_next(ctx)
+        return
+
     await ctx.send(f"🎵 現在正在播放: **{next_song.title}** ({format_duration(next_song.duration)})")
-
-
-async def ensure_voice(ctx: commands.Context) -> bool:
-    if not ctx.author.voice or not ctx.author.voice.channel:
-        await ctx.send("你必須先加入一個語音頻道！")
-        return False
-
-    channel = ctx.author.voice.channel
-    if ctx.voice_client is None:
-        await channel.connect()
-    elif ctx.voice_client.channel != channel:
-        await ctx.voice_client.move_to(channel)
-    return True
 
 
 # 3. 建立指令
@@ -149,18 +237,35 @@ async def on_ready():
 
 @bot.command(name="join", help="讓機器人加入你的語音頻道")
 async def join(ctx):
-    if not await ensure_voice(ctx):
+    if ctx.guild is None:
+        await ctx.send("此指令只能在伺服器中使用。")
         return
+
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send("你必須先加入一個語音頻道！")
+        return
+
+    channel = ctx.author.voice.channel
+    if ctx.voice_client is None:
+        await channel.connect()
+    elif ctx.voice_client.channel != channel:
+        state = get_state(ctx.guild.id)
+        is_busy = ctx.voice_client.is_playing() or ctx.voice_client.is_paused() or bool(state.queue)
+        if is_busy:
+            await ctx.send(f"目前正在服務 {ctx.voice_client.channel.mention}，請到同一頻道操作。")
+            return
+        await ctx.voice_client.move_to(channel)
+
     await ctx.send(f"已加入語音頻道：{ctx.voice_client.channel}")
 
 
-@bot.command(name="play", help="播放 YouTube 音樂 (輸入: !play <網址或關鍵字>)")
+@bot.command(name="p", help="播放 YouTube 音樂 (輸入: !p <網址或關鍵字>)")
 async def play(ctx, *, query: str):
     if ctx.guild is None:
         await ctx.send("此指令只能在伺服器中使用。")
         return
 
-    if not await ensure_voice(ctx):
+    if not await ensure_voice_for_play(ctx):
         return
 
     state = get_state(ctx.guild.id)
@@ -170,10 +275,12 @@ async def play(ctx, *, query: str):
         try:
             song = await extract_song(query)
         except Exception as error:
-            await ctx.send(f"播放時發生錯誤，可能是網址無效或被 YouTube 阻擋。({error})")
+            print(f"[play] extract_song error: {error}")
+            await ctx.send(f"⚠️ 播放失敗：{classify_error(error)}")
             return
 
     async with state.lock:
+        cancel_idle_disconnect(state)
         state.queue.append(song)
         should_start = not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused())
 
@@ -186,6 +293,9 @@ async def play(ctx, *, query: str):
 
 @bot.command(name="skip", help="跳過目前歌曲")
 async def skip(ctx):
+    if not await ensure_same_voice_channel(ctx):
+        return
+
     if not ctx.voice_client or not ctx.voice_client.is_playing():
         await ctx.send("目前沒有正在播放的歌曲。")
         return
@@ -195,6 +305,9 @@ async def skip(ctx):
 
 @bot.command(name="pause", help="暫停播放")
 async def pause(ctx):
+    if not await ensure_same_voice_channel(ctx):
+        return
+
     if not ctx.voice_client or not ctx.voice_client.is_playing():
         await ctx.send("目前沒有正在播放的歌曲。")
         return
@@ -204,6 +317,9 @@ async def pause(ctx):
 
 @bot.command(name="resume", help="繼續播放")
 async def resume(ctx):
+    if not await ensure_same_voice_channel(ctx):
+        return
+
     if not ctx.voice_client or not ctx.voice_client.is_paused():
         await ctx.send("目前沒有暫停中的歌曲。")
         return
@@ -217,6 +333,9 @@ async def stop(ctx):
         await ctx.send("此指令只能在伺服器中使用。")
         return
 
+    if not await ensure_same_voice_channel(ctx):
+        return
+
     state = get_state(ctx.guild.id)
     async with state.lock:
         state.queue.clear()
@@ -224,6 +343,8 @@ async def stop(ctx):
 
     if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         ctx.voice_client.stop()
+    else:
+        schedule_idle_disconnect(ctx.guild.id)
 
     await ctx.send("⏹️ 已停止播放並清空佇列。")
 
@@ -277,16 +398,42 @@ async def leave(ctx):
         await ctx.send("此指令只能在伺服器中使用。")
         return
 
+    if not await ensure_same_voice_channel(ctx):
+        return
+
     if ctx.voice_client:
         state = get_state(ctx.guild.id)
         async with state.lock:
             state.queue.clear()
             state.now_playing = None
+            cancel_idle_disconnect(state)
 
         await ctx.voice_client.disconnect()
         await ctx.send("👋 已經離開語音頻道。")
     else:
         await ctx.send("我目前不在任何語音頻道裡面喔！")
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("參數不足，請檢查指令格式。")
+        return
+
+    if isinstance(error, commands.BadArgument):
+        await ctx.send("參數格式錯誤，請確認輸入內容。")
+        return
+
+    if isinstance(error, commands.CommandInvokeError) and error.original:
+        await ctx.send(f"⚠️ 指令執行失敗：{classify_error(error.original)}")
+        print(f"[command] invoke error: {error.original}")
+        return
+
+    await ctx.send(f"⚠️ 指令失敗：{classify_error(error)}")
+    print(f"[command] unhandled error: {error}")
 
 
 # 4. 啟動機器人 (請設定環境變數 DISCORD_BOT_TOKEN)
