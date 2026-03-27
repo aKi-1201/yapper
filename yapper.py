@@ -35,6 +35,10 @@ ffmpeg_options = {
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
 IDLE_DISCONNECT_SECONDS = 300
+AUTO_DELETE_USER_COMMANDS = True
+DELETE_COMMAND_DELAY_SECONDS = 1.0
+DELETE_ON_COMMAND_ERROR = True
+DELETE_PERMISSION_NOTICE_COOLDOWN_SECONDS = 300
 
 
 @dataclass
@@ -53,6 +57,7 @@ class GuildMusicState:
     volume: float = 0.5
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     idle_disconnect_task: Optional[asyncio.Task] = None
+    last_delete_permission_notice_at: float = 0.0
 
 
 music_states: dict[int, GuildMusicState] = {}
@@ -153,6 +158,53 @@ def schedule_idle_disconnect(guild_id: int) -> None:
     state.idle_disconnect_task = asyncio.create_task(idle_disconnect_worker(guild_id))
 
 
+async def _notify_delete_permission_issue(ctx: commands.Context) -> None:
+    if ctx.guild is None:
+        return
+
+    state = get_state(ctx.guild.id)
+    now = asyncio.get_running_loop().time()
+    if now - state.last_delete_permission_notice_at < DELETE_PERMISSION_NOTICE_COOLDOWN_SECONDS:
+        return
+
+    state.last_delete_permission_notice_at = now
+    await ctx.send("⚠️ 我沒有刪除訊息權限，無法自動清理使用者指令訊息。")
+
+
+async def cleanup_user_command_message(ctx: commands.Context, *, from_error: bool = False) -> None:
+    if not AUTO_DELETE_USER_COMMANDS:
+        return
+
+    if from_error and not DELETE_ON_COMMAND_ERROR:
+        return
+
+    if getattr(ctx, "_command_message_cleaned", False):
+        return
+
+    message = ctx.message
+    if message is None:
+        return
+
+    if ctx.guild is not None:
+        me = ctx.guild.me
+        if me is not None and not ctx.channel.permissions_for(me).manage_messages:
+            await _notify_delete_permission_issue(ctx)
+            return
+
+    if DELETE_COMMAND_DELAY_SECONDS > 0:
+        await asyncio.sleep(DELETE_COMMAND_DELAY_SECONDS)
+
+    try:
+        await message.delete()
+        setattr(ctx, "_command_message_cleaned", True)
+    except discord.NotFound:
+        setattr(ctx, "_command_message_cleaned", True)
+    except discord.Forbidden:
+        await _notify_delete_permission_issue(ctx)
+    except discord.HTTPException:
+        pass
+
+
 async def ensure_same_voice_channel(ctx: commands.Context) -> bool:
     if ctx.voice_client is None or ctx.voice_client.channel is None:
         await ctx.send("我目前不在語音頻道中。")
@@ -235,6 +287,11 @@ async def on_ready():
     print(f"成功登入！機器人名稱：{bot.user}")
 
 
+@bot.after_invoke
+async def after_invoke_cleanup(ctx):
+    await cleanup_user_command_message(ctx)
+
+
 @bot.command(name="join", help="讓機器人加入你的語音頻道")
 async def join(ctx):
     if ctx.guild is None:
@@ -259,7 +316,7 @@ async def join(ctx):
     await ctx.send(f"已加入語音頻道：{ctx.voice_client.channel}")
 
 
-@bot.command(name="p", help="播放 YouTube 音樂 (輸入: !p <網址或關鍵字>)")
+@bot.command(name="play", aliases=["p"], help="播放 YouTube 音樂 (輸入: !play <網址或關鍵字>)")
 async def play(ctx, *, query: str):
     if ctx.guild is None:
         await ctx.send("此指令只能在伺服器中使用。")
@@ -416,6 +473,8 @@ async def leave(ctx):
 
 @bot.event
 async def on_command_error(ctx, error):
+    await cleanup_user_command_message(ctx, from_error=True)
+
     if isinstance(error, commands.CommandNotFound):
         return
 
