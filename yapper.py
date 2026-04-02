@@ -18,7 +18,8 @@ app_commands_synced = False
 
 # 2. 設定 yt-dlp 與 FFmpeg 的參數
 ytdl_format_options = {
-    "format": "bestaudio/best",
+    # 優先尋找 opus 且 <= 96k 的音訊，找不到再退而求其次，這樣能最大化節省頻寬與轉碼效能
+    "format": "bestaudio[acodec=opus][abr<=96]/bestaudio[abr<=96]/bestaudio/best",
     "outtmpl": "%(extractor)s-%(id)s-%(title)s.%(ext)s",
     "restrictfilenames": True,
     "cachedir": False,
@@ -29,12 +30,14 @@ ytdl_format_options = {
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
-    "source_address": "0.0.0.0",  # 綁定 ipv4 避免某些 ipv6 造成的問題
+    "source_address": "0.0.0.0",  
 }
 
 ffmpeg_options = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",  # 告訴 FFmpeg 不要處理影像，只要音訊
+    # -vn: 不要影像
+    # -threads 1: 限制單執行緒，大幅降低 NAS 的 CPU 瞬間負載
+    "options": "-vn -threads 1",
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
@@ -59,7 +62,6 @@ class GuildMusicState:
     queue: deque[Song] = field(default_factory=deque)
     now_playing: Optional[Song] = None
     text_channel_id: Optional[int] = None
-    volume: float = 0.5
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     idle_disconnect_task: Optional[asyncio.Task] = None
     last_delete_permission_notice_at: float = 0.0
@@ -254,6 +256,15 @@ async def ensure_voice_for_play(ctx: commands.Context) -> bool:
     return True
 
 
+async def create_audio_source(stream_url: str) -> discord.FFmpegOpusAudio:
+    # from_probe 會在可行時使用 copy，讓 Opus 來源可直通送進 Discord。
+    return await discord.FFmpegOpusAudio.from_probe(
+        stream_url,
+        method="fallback",
+        **ffmpeg_options,
+    )
+
+
 async def play_next(ctx: commands.Context) -> None:
     voice_client = ctx.voice_client
     if voice_client is None:
@@ -274,10 +285,13 @@ async def play_next(ctx: commands.Context) -> None:
         next_song = state.queue.popleft()
         state.now_playing = next_song
 
-        source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(next_song.stream_url, **ffmpeg_options),
-            volume=state.volume,
-        )
+    try:
+        source = await create_audio_source(next_song.stream_url)
+    except Exception as error:
+        state.now_playing = None
+        await ctx.send(f"⚠️ 無法建立 Opus 音訊來源：{classify_error(error)}")
+        await play_next(ctx)
+        return
 
     async def handle_after_playback(error: Optional[Exception]) -> None:
         if error:
