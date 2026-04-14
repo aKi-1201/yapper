@@ -18,8 +18,8 @@ app_commands_synced = False
 
 # 2. 設定 yt-dlp 與 FFmpeg 的參數
 ytdl_format_options = {
-    # 優先尋找 opus 且 <= 96k 的音訊，找不到再退而求其次，這樣能最大化節省頻寬與轉碼效能
-    "format": "bestaudio[acodec=opus][abr<=96]/bestaudio[abr<=96]/bestaudio/best",
+    # Use the simplest fallback-friendly format to avoid "Requested format is not available" errors
+    "format": "bestaudio/best",
     "outtmpl": "%(extractor)s-%(id)s-%(title)s.%(ext)s",
     "restrictfilenames": True,
     "cachedir": False,
