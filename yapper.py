@@ -18,8 +18,14 @@ app_commands_synced = False
 
 # 2. 設定 yt-dlp 與 FFmpeg 的參數
 ytdl_format_options = {
-    "format": "bv*+ba/b",
-    "extractor_args": {"youtube": ["player_client=android", "player_skip=webpage"]},
+    "format": "best",
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android"],
+            "player_skip": ["webpage", "configs"],
+            "skip": ["dash", "hls"],
+        }
+    },
     "outtmpl": "%(extractor)s-%(id)s-%(title)s.%(ext)s",
     "restrictfilenames": True,
     "cachedir": False,
@@ -32,6 +38,10 @@ ytdl_format_options = {
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "cookiefile": "cookies.txt",
+    "skip_download": True,
+    "no_check_formats": True,
+    "youtube_include_dash_manifest": False,
+    "youtube_include_hls_manifest": False,
 }
 
 ffmpeg_options = {
@@ -115,11 +125,12 @@ async def extract_song(query: str) -> Song:
 
     formats = data.get("formats") or []
     stream_url = None
-    # Iterate in reverse so higher-quality formats (listed last) are preferred
+    # Prefer audio-containing formats with valid URLs (iterate in reverse for higher quality first)
     for f in reversed(formats):
         if f.get("acodec") not in (None, "none") and f.get("url"):
             stream_url = f["url"]
             break
+    # Fallback to top-level URL if no audio-only format was found
     if not stream_url:
         stream_url = data.get("url")
 
