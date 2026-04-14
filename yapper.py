@@ -18,8 +18,9 @@ app_commands_synced = False
 
 # 2. 設定 yt-dlp 與 FFmpeg 的參數
 ytdl_format_options = {
-    # Use the simplest fallback-friendly format to avoid "Requested format is not available" errors
-    "format": "bestaudio/best",
+    # Use "best" to allow fallback to combined audio+video streams, bypassing audio-only format restrictions
+    "format": "best",
+    "extractor_args": {"youtube": ["player_client=android", "player_skip=webpage"]},
     "outtmpl": "%(extractor)s-%(id)s-%(title)s.%(ext)s",
     "restrictfilenames": True,
     "cachedir": False,
