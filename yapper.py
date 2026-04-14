@@ -18,8 +18,7 @@ app_commands_synced = False
 
 # 2. 設定 yt-dlp 與 FFmpeg 的參數
 ytdl_format_options = {
-    # Use "best" to allow fallback to combined audio+video streams, bypassing audio-only format restrictions
-    "format": "best",
+    "format": "bv*+ba/b",
     "extractor_args": {"youtube": ["player_client=android", "player_skip=webpage"]},
     "outtmpl": "%(extractor)s-%(id)s-%(title)s.%(ext)s",
     "restrictfilenames": True,
@@ -114,7 +113,16 @@ async def extract_song(query: str) -> Song:
             raise ValueError("找不到可播放的結果")
         data = entries[0]
 
-    stream_url = data.get("url")
+    formats = data.get("formats") or []
+    stream_url = None
+    # Iterate in reverse so higher-quality formats (listed last) are preferred
+    for f in reversed(formats):
+        if f.get("acodec") not in (None, "none") and f.get("url"):
+            stream_url = f["url"]
+            break
+    if not stream_url:
+        stream_url = data.get("url")
+
     title = data.get("title") or "未知標題"
     webpage_url = data.get("webpage_url") or query
     duration = data.get("duration")
